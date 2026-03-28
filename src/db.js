@@ -22,32 +22,27 @@ export function voteCutoffIso() {
 }
 
 function normalizeAddress(value) {
-  return String(value || '').replace(/\s+/g, '').trim();
+  return String(value || '').trim().replace(/\s+/g, '');
 }
 
-function isMissingColumn(error, column) {
-  const msg = String(error?.message || error || '');
-  return msg.includes(column) || msg.includes(`column \"${column}\"`);
-}
-
-function isMissingTable(error, table) {
-  const msg = String(error?.message || error || '');
-  return msg.includes(`relation \"${table}\"`) || msg.includes(`table \"${table}\"`);
+function normalizeText(value) {
+  const v = String(value || '').trim();
+  return v === '-' ? null : v;
 }
 
 export async function upsertTelegramUser(from) {
   if (!from?.id) return;
-  try {
-    await supabase.from('telegram_users').upsert({
+  const { error } = await supabase.from('telegram_users').upsert(
+    {
       telegram_id: String(from.id),
       username: from.username || null,
       first_name: from.first_name || null,
       last_name: from.last_name || null,
       updated_at: nowIso(),
-    }, { onConflict: 'telegram_id' });
-  } catch (error) {
-    console.error('upsertTelegramUser failed', error);
-  }
+    },
+    { onConflict: 'telegram_id' },
+  );
+  if (error) throw error;
 }
 
 export async function getApprovedTokens(limit = 10) {
@@ -66,40 +61,31 @@ export async function getTokenByAddress(address) {
   const normalized = normalizeAddress(address);
   if (!normalized) return null;
 
-  let { data, error } = await supabase
-    .from('tokens')
-    .select('*')
-    .eq('address', normalized)
-    .maybeSingle();
+  const { data, error } = await supabase.from('tokens').select('*').eq('address', normalized).maybeSingle();
   if (error) throw error;
   if (data) return data;
 
-  const { data: alt, error: altError } = await supabase
+  const { data: fallback, error: fallbackError } = await supabase
     .from('tokens')
     .select('*')
-    .ilike('address', normalized)
-    .limit(1)
-    .maybeSingle();
-  if (altError) throw altError;
-  return alt;
+    .limit(500);
+  if (fallbackError) throw fallbackError;
+  return (fallback || []).find((row) => normalizeAddress(row.address) === normalized) || null;
 }
 
 export async function submitToken(payload) {
-  const insertPayload = {
-    category: 'General',
-    promoted: false,
-    votes_24h: 0,
-    votes_all_time: 0,
-    admin_boost_votes: 0,
-    source: 'telegram',
-    status: 'pending',
+  const cleanPayload = {
     ...payload,
     address: normalizeAddress(payload.address),
+    website: normalizeText(payload.website),
+    telegram: normalizeText(payload.telegram),
+    twitter: normalizeText(payload.twitter),
+    logo_url: normalizeText(payload.logo_url) || null,
   };
 
   const { data, error } = await supabase
     .from('tokens')
-    .insert(insertPayload)
+    .insert(cleanPayload)
     .select('id,name,symbol,address,status,listing_tier,payment_reference')
     .single();
   if (error) throw error;
@@ -107,25 +93,18 @@ export async function submitToken(payload) {
 }
 
 export async function canTelegramVote(telegramId, address) {
-  try {
-    const { data, error } = await supabase
-      .from('vote_logs')
-      .select('created_at')
-      .eq('token_address', normalizeAddress(address))
-      .eq('voter_key', `tg:${telegramId}`)
-      .gte('created_at', voteCutoffIso())
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw error;
-    return data;
-  } catch (error) {
-    if (isMissingTable(error, 'vote_logs')) {
-      console.error('vote_logs table missing, skipping cooldown check');
-      return null;
-    }
-    throw error;
-  }
+  const normalized = normalizeAddress(address);
+  const { data, error } = await supabase
+    .from('vote_logs')
+    .select('created_at')
+    .eq('token_address', normalized)
+    .eq('voter_key', `tg:${telegramId}`)
+    .gte('created_at', voteCutoffIso())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
 export async function castTelegramVote(telegramId, address) {
@@ -135,106 +114,87 @@ export async function castTelegramVote(telegramId, address) {
   const currentAllTime = Number(token.votes_all_time || 0);
   const current24h = Number(token.votes_24h || 0);
 
-  const { data, error: updateError } = await supabase
+  const { error: updateError } = await supabase
     .from('tokens')
     .update({ votes_all_time: currentAllTime + 1, votes_24h: current24h + 1 })
-    .eq('address', normalized)
-    .select('name,symbol,address,votes_all_time,votes_24h,admin_boost_votes')
-    .single();
+    .eq('address', token.address);
   if (updateError) throw updateError;
 
-  try {
-    const { error: logError } = await supabase.from('vote_logs').insert({
-      token_address: normalized,
-      voter_key: `tg:${telegramId}`,
-      source: 'telegram',
-    });
-    if (logError) throw logError;
-  } catch (error) {
-    if (!isMissingTable(error, 'vote_logs')) throw error;
-    console.error('vote_logs insert skipped because table is missing');
-  }
-
-  return data || { ...token, votes_all_time: currentAllTime + 1, votes_24h: current24h + 1 };
+  const { error: logError } = await supabase.from('vote_logs').insert({
+    token_address: token.address,
+    voter_key: `tg:${telegramId}`,
+    source: 'telegram',
+  });
+  if (logError) throw logError;
+  return { ...token, votes_all_time: currentAllTime + 1, votes_24h: current24h + 1 };
 }
 
 export async function getMyListings(telegramId) {
-  try {
-    const { data, error } = await supabase
-      .from('tokens')
-      .select('name,symbol,address,status,listing_tier,promoted,listed_at,payment_reference,submitted_by_telegram_id')
-      .eq('submitted_by_telegram_id', String(telegramId))
-      .order('listed_at', { ascending: false })
-      .limit(20);
-    if (error) throw error;
-    return data || [];
-  } catch (error) {
-    if (isMissingColumn(error, 'submitted_by_telegram_id')) {
-      console.error('submitted_by_telegram_id column missing; returning no listings');
-      return [];
-    }
-    throw error;
-  }
+  const { data, error } = await supabase
+    .from('tokens')
+    .select('name,symbol,address,status,listing_tier,promoted,listed_at,payment_reference')
+    .eq('submitted_by_telegram_id', String(telegramId))
+    .order('listed_at', { ascending: false })
+    .limit(20);
+  if (error) throw error;
+  return data || [];
 }
 
 export async function recordPaymentIntent(payload) {
-  try {
-    const { error } = await supabase.from('payments').insert(payload);
-    if (error) throw error;
-  } catch (error) {
-    if (isMissingTable(error, 'payments')) {
-      console.error('payments table missing, skipping payment intent record');
-      return;
-    }
-    throw error;
-  }
+  const { error } = await supabase.from('payments').insert(payload);
+  if (error) throw error;
 }
 
 export async function approveToken(address) {
-  const { error } = await supabase
-    .from('tokens')
-    .update({ status: 'approved' })
-    .eq('address', normalizeAddress(address));
+  const token = await getTokenByAddress(address);
+  if (!token) throw new Error('Token not found');
+  const { error } = await supabase.from('tokens').update({ status: 'approved' }).eq('address', token.address);
   if (error) throw error;
 }
 
 export async function rejectToken(address, reason = null) {
+  const token = await getTokenByAddress(address);
+  if (!token) throw new Error('Token not found');
   const { error } = await supabase
     .from('tokens')
     .update({ status: 'rejected', admin_notes: reason })
-    .eq('address', normalizeAddress(address));
+    .eq('address', token.address);
   if (error) throw error;
 }
 
 export async function boostVotes(address, amount, reason = 'manual boost') {
-  const normalized = normalizeAddress(address);
-  const token = await getTokenByAddress(normalized);
+  const token = await getTokenByAddress(address);
   if (!token) throw new Error('Token not found');
-  const numericAmount = Number(amount || 0);
-  const nextBoost = Number(token.admin_boost_votes || 0) + numericAmount;
+  const nextBoost = Number(token.admin_boost_votes || 0) + Number(amount || 0);
   const { error: updateError } = await supabase
     .from('tokens')
     .update({ admin_boost_votes: nextBoost })
-    .eq('address', normalized);
+    .eq('address', token.address);
   if (updateError) throw updateError;
 
-  try {
-    const { error: logError } = await supabase.from('admin_actions').insert({
-      token_address: normalized,
-      action: 'boost_votes',
-      value: numericAmount,
-      reason,
-    });
-    if (logError) throw logError;
-  } catch (error) {
-    if (!isMissingTable(error, 'admin_actions')) throw error;
-    console.error('admin_actions table missing, skipping action log');
-  }
+  const { error: logError } = await supabase.from('admin_actions').insert({
+    token_address: token.address,
+    action: 'boost_votes',
+    value: Number(amount || 0),
+    reason,
+  });
+  if (logError) throw logError;
   return nextBoost;
 }
 
 export async function searchTokens(term) {
-  const like = `%${String(term || '').trim()}%`;
+  const normalized = String(term || '').trim();
+  if (!normalized) {
+    const { data, error } = await supabase
+      .from('tokens')
+      .select('name,symbol,address,status,votes_all_time,admin_boost_votes')
+      .order('listed_at', { ascending: false })
+      .limit(20);
+    if (error) throw error;
+    return data || [];
+  }
+
+  const like = `%${normalized}%`;
   const { data, error } = await supabase
     .from('tokens')
     .select('name,symbol,address,status,votes_all_time,admin_boost_votes')
