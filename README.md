@@ -1,6 +1,6 @@
-# TonGemz Telegram Bot
+# KYRON Telegram Bot
 
-This is the live Telegram bot for TonGemz. It connects to the same Supabase project as the website.
+This is the live Telegram bot for KYRON. It connects to the same Supabase project as the website.
 
 ## What it does
 - `/start` main menu
