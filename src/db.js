@@ -21,34 +21,21 @@ export function voteCutoffIso() {
   return new Date(Date.now() - COOLDOWN_HOURS * 60 * 60 * 1000).toISOString();
 }
 
-function normalizeAddress(value) {
-  return String(value || '').trim().replace(/\s+/g, '');
-}
-
-function normalizeText(value) {
-  const v = String(value || '').trim();
-  return v === '-' ? null : v;
-}
-
 export async function upsertTelegramUser(from) {
   if (!from?.id) return;
-  const { error } = await supabase.from('telegram_users').upsert(
-    {
-      telegram_id: String(from.id),
-      username: from.username || null,
-      first_name: from.first_name || null,
-      last_name: from.last_name || null,
-      updated_at: nowIso(),
-    },
-    { onConflict: 'telegram_id' },
-  );
-  if (error) throw error;
+  await supabase.from('telegram_users').upsert({
+    telegram_id: String(from.id),
+    username: from.username || null,
+    first_name: from.first_name || null,
+    last_name: from.last_name || null,
+    updated_at: nowIso(),
+  }, { onConflict: 'telegram_id' });
 }
 
 export async function getApprovedTokens(limit = 10) {
   const { data, error } = await supabase
     .from('tokens')
-    .select('name,symbol,address,votes_all_time,votes_24h,admin_boost_votes,promoted,status')
+    .select('name,symbol,address,votes_all_time,votes_24h,admin_boost_votes,promoted')
     .eq('status', 'approved')
     .order('promoted', { ascending: false })
     .order('votes_all_time', { ascending: false })
@@ -58,34 +45,19 @@ export async function getApprovedTokens(limit = 10) {
 }
 
 export async function getTokenByAddress(address) {
-  const normalized = normalizeAddress(address);
-  if (!normalized) return null;
-
-  const { data, error } = await supabase.from('tokens').select('*').eq('address', normalized).maybeSingle();
-  if (error) throw error;
-  if (data) return data;
-
-  const { data: fallback, error: fallbackError } = await supabase
+  const { data, error } = await supabase
     .from('tokens')
     .select('*')
-    .limit(500);
-  if (fallbackError) throw fallbackError;
-  return (fallback || []).find((row) => normalizeAddress(row.address) === normalized) || null;
+    .eq('address', address)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
 export async function submitToken(payload) {
-  const cleanPayload = {
-    ...payload,
-    address: normalizeAddress(payload.address),
-    website: normalizeText(payload.website),
-    telegram: normalizeText(payload.telegram),
-    twitter: normalizeText(payload.twitter),
-    logo_url: normalizeText(payload.logo_url) || null,
-  };
-
   const { data, error } = await supabase
     .from('tokens')
-    .insert(cleanPayload)
+    .insert(payload)
     .select('id,name,symbol,address,status,listing_tier,payment_reference')
     .single();
   if (error) throw error;
@@ -93,11 +65,10 @@ export async function submitToken(payload) {
 }
 
 export async function canTelegramVote(telegramId, address) {
-  const normalized = normalizeAddress(address);
   const { data, error } = await supabase
     .from('vote_logs')
     .select('created_at')
-    .eq('token_address', normalized)
+    .eq('token_address', address)
     .eq('voter_key', `tg:${telegramId}`)
     .gte('created_at', voteCutoffIso())
     .order('created_at', { ascending: false })
@@ -108,8 +79,7 @@ export async function canTelegramVote(telegramId, address) {
 }
 
 export async function castTelegramVote(telegramId, address) {
-  const normalized = normalizeAddress(address);
-  const token = await getTokenByAddress(normalized);
+  const token = await getTokenByAddress(address);
   if (!token) throw new Error('Token not found');
   const currentAllTime = Number(token.votes_all_time || 0);
   const current24h = Number(token.votes_24h || 0);
@@ -117,11 +87,11 @@ export async function castTelegramVote(telegramId, address) {
   const { error: updateError } = await supabase
     .from('tokens')
     .update({ votes_all_time: currentAllTime + 1, votes_24h: current24h + 1 })
-    .eq('address', token.address);
+    .eq('address', address);
   if (updateError) throw updateError;
 
   const { error: logError } = await supabase.from('vote_logs').insert({
-    token_address: token.address,
+    token_address: address,
     voter_key: `tg:${telegramId}`,
     source: 'telegram',
   });
@@ -146,19 +116,18 @@ export async function recordPaymentIntent(payload) {
 }
 
 export async function approveToken(address) {
-  const token = await getTokenByAddress(address);
-  if (!token) throw new Error('Token not found');
-  const { error } = await supabase.from('tokens').update({ status: 'approved' }).eq('address', token.address);
+  const { error } = await supabase
+    .from('tokens')
+    .update({ status: 'approved' })
+    .eq('address', address);
   if (error) throw error;
 }
 
 export async function rejectToken(address, reason = null) {
-  const token = await getTokenByAddress(address);
-  if (!token) throw new Error('Token not found');
   const { error } = await supabase
     .from('tokens')
     .update({ status: 'rejected', admin_notes: reason })
-    .eq('address', token.address);
+    .eq('address', address);
   if (error) throw error;
 }
 
@@ -169,11 +138,11 @@ export async function boostVotes(address, amount, reason = 'manual boost') {
   const { error: updateError } = await supabase
     .from('tokens')
     .update({ admin_boost_votes: nextBoost })
-    .eq('address', token.address);
+    .eq('address', address);
   if (updateError) throw updateError;
 
   const { error: logError } = await supabase.from('admin_actions').insert({
-    token_address: token.address,
+    token_address: address,
     action: 'boost_votes',
     value: Number(amount || 0),
     reason,
@@ -183,18 +152,7 @@ export async function boostVotes(address, amount, reason = 'manual boost') {
 }
 
 export async function searchTokens(term) {
-  const normalized = String(term || '').trim();
-  if (!normalized) {
-    const { data, error } = await supabase
-      .from('tokens')
-      .select('name,symbol,address,status,votes_all_time,admin_boost_votes')
-      .order('listed_at', { ascending: false })
-      .limit(20);
-    if (error) throw error;
-    return data || [];
-  }
-
-  const like = `%${normalized}%`;
+  const like = `%${term}%`;
   const { data, error } = await supabase
     .from('tokens')
     .select('name,symbol,address,status,votes_all_time,admin_boost_votes')
